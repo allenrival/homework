@@ -1,10 +1,9 @@
 package cs245.as3;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
+import java.util.*;
 
+import cs245.as3.driver.LogManagerImpl;
 import cs245.as3.interfaces.LogManager;
 import cs245.as3.interfaces.StorageManager;
 import cs245.as3.interfaces.StorageManager.TaggedValue;
@@ -23,10 +22,10 @@ import cs245.as3.interfaces.StorageManager.TaggedValue;
 public class TransactionManager {
 	private LogManager lm=null;
 	private StorageManager sm=null;
-	long logk=Long.MAX_VALUE;
-	long logtag=Long.MAX_VALUE;
-	int logl=-1;
-	private HashMap<Long, TaggedValue> lass=new HashMap<>();
+	private long logk=-1;
+	private long logtag=-1;
+	private int logl=-1;
+	private final HashMap<Long, TaggedValue> lass=new HashMap<>();
 	class WritesetEntry {
 		public long key;
 		public byte[] value;
@@ -57,26 +56,35 @@ public class TransactionManager {
 	public void initAndRecover(StorageManager sm, LogManager lm) {
 		this.lm=lm;
 		this.sm=sm;
-		latestValues = sm.readStoredTable();
+		latestValues = this.sm.readStoredTable();
+		HashMap<Long,TaggedValue>store=new HashMap<>();
 		int offset=this.lm.getLogTruncationOffset();
+		boolean flag=true;
 		while(offset<this.lm.getLogEndOffset()){
-			byte[] record=this.lm.readLogRecord(offset,20);
-			ByteBuffer wrap=ByteBuffer.wrap(record,0,8);
+			byte[] record=this.lm.readLogRecord(offset,Math.min(128,this.lm.getLogEndOffset()-offset));
+			ByteBuffer wrap=ByteBuffer.wrap(record);
 			long key=wrap.getLong();
-			ByteBuffer wrap1=ByteBuffer.wrap(record,8,8);
-			long tag=wrap1.getLong();
-			ByteBuffer wrap2=ByteBuffer.wrap(record,16,4);
-			int l=wrap2.getInt();
+			long tag=wrap.getLong();
+			int l=wrap.getInt();
 			offset+=20;
-			record=this.lm.readLogRecord(offset,l);
-			ByteBuffer wrap3=ByteBuffer.wrap(record,0,l);
 			byte[] value=new byte[l];
-			wrap3.get(value);
+			wrap.get(value);
 			offset+=l;
-			latestValues.put(key,new TaggedValue(tag,value));
-			sm.queueWrite(key,tag,value);
+			if(flag&&key!=-1&&key!=-2){
+				store.put(key,new TaggedValue(tag,value));
+			}else if(flag&&key==-1){
+				for(Map.Entry<Long,TaggedValue> entry:store.entrySet()){
+					TaggedValue t=entry.getValue();
+					latestValues.put(entry.getKey(),new TaggedValue(t.tag,t.value));
+					this.sm.queueWrite(entry.getKey(),t.tag,t.value);
+				}
+				store.clear();
+				flag=false;
+			}else if(key==-2) {
+				flag=true;
+				store.clear();
+			}
 		}
-		this.lm.setLogTruncationOffset(offset);
 	}
 
 	/**
@@ -111,22 +119,39 @@ public class TransactionManager {
 	 * Commits a transaction, and makes its writes visible to subsequent read operations.\
 	 */
 	public void commit(long txID) {
+		HashMap<Long,TaggedValue> store=new HashMap<>();
 		ArrayList<WritesetEntry> writeset = writesets.get(txID);
 		if (writeset != null) {
-			for(WritesetEntry x : writeset) {
+			ByteBuffer ret = ByteBuffer.allocate(20+"start".getBytes().length);
+			ret.putLong(-2);
+			ret.putLong(-2);
+			ret.putInt("start".getBytes().length);
+			ret.put("start".getBytes());
+			lm.appendLogRecord(ret.array());
+			for (WritesetEntry x : writeset) {
 				//tag is unused in this implementation:
-				long tag = latestValues.getOrDefault(x.key,new TaggedValue(0,null)).tag+1;
-				latestValues.put(x.key, new TaggedValue(tag, x.value));
-				ByteBuffer ret=ByteBuffer.allocate(Long.BYTES+Long.BYTES+Integer.BYTES+x.value.length);
+				long tag = latestValues.getOrDefault(x.key, new TaggedValue(0, null)).tag + 1;
+				ret = ByteBuffer.allocate(20+ x.value.length);
 				ret.putLong(x.key);
 				ret.putLong(tag);
 				ret.putInt(x.value.length);
 				ret.put(x.value);
-				this.lm.appendLogRecord(ret.array());
-				sm.queueWrite(x.key,tag,x.value);
+				lm.appendLogRecord(ret.array());
+				store.put(x.key,new TaggedValue(tag, x.value));
 			}
-			writesets.remove(txID);
+			ret = ByteBuffer.allocate(20+"commit".getBytes().length);
+			ret.putLong(-1L);
+			ret.putLong(-1L);
+			ret.putInt("commit".getBytes().length);
+			ret.put("commit".getBytes());
+			lm.appendLogRecord(ret.array());
+			for(Map.Entry<Long,TaggedValue> entry:store.entrySet()){
+				TaggedValue t=entry.getValue();
+				latestValues.put(entry.getKey(),new TaggedValue(t.tag,t.value));
+				this.sm.queueWrite(entry.getKey(),t.tag,t.value);
+			}
 		}
+		writesets.remove(txID);
 	}
 	/**
 	 * Aborts a transaction.
@@ -141,31 +166,22 @@ public class TransactionManager {
 	 */
 	public void writePersisted(long key, long persisted_tag, byte[] persisted_value) {
 		lass.put(key,new TaggedValue(persisted_tag,persisted_value));
-		if(logk==Long.MAX_VALUE&&logtag==Long.MAX_VALUE){
-			int offset=this.lm.getLogTruncationOffset();
-			if(offset!=this.lm.getLogEndOffset()){
+		int offset=lm.getLogTruncationOffset();
+		while(offset<lm.getLogEndOffset()){
+			if(logl==-1){
 				byte[] record=this.lm.readLogRecord(offset,20);
-				ByteBuffer wrap=ByteBuffer.wrap(record,0,8);
+				ByteBuffer wrap=ByteBuffer.wrap(record);
 				logk=wrap.getLong();
-				ByteBuffer wrap1=ByteBuffer.wrap(record,8,8);
-				logtag=wrap1.getLong();
-				ByteBuffer wrap2=ByteBuffer.wrap(record,16,4);
-				logl=wrap2.getInt();
+				logtag=wrap.getLong();
+				logl=wrap.getInt();
 			}
-		}
-		persisted_tag = lass.getOrDefault(logk, new TaggedValue(0,null)).tag;
-		while(persisted_tag>=logtag) {
-			if(this.lm.getLogTruncationOffset() + 20+logl>=this.lm.getLogEndOffset()) break;
-			this.lm.setLogTruncationOffset(this.lm.getLogTruncationOffset() + 20+logl);
-			int offset = this.lm.getLogTruncationOffset();
-			byte[] record = this.lm.readLogRecord(offset, 20);
-			ByteBuffer wrap = ByteBuffer.wrap(record, 0, 8);
-			logk = wrap.getLong();
-			ByteBuffer wrap1 = ByteBuffer.wrap(record, 8, 8);
-			logtag = wrap1.getLong();
+			offset+=20+logl;
 			persisted_tag = lass.getOrDefault(logk, new TaggedValue(0,null)).tag;
-			ByteBuffer wrap2=ByteBuffer.wrap(record,16,4);
-			logl=wrap2.getInt();
+			if(persisted_tag>=logtag){
+				lm.setLogTruncationOffset(offset);
+				logl=-1;
+			}else break;
+
 		}
 	}
 }
